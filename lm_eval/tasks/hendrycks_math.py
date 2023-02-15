@@ -9,6 +9,11 @@ models to generate answer derivations and explanations.
 Homepage: https://github.com/hendrycks/math
 """
 import inspect
+import signal
+import re
+import sympy
+import numpy as np
+from contextlib import contextmanager
 import lm_eval.datasets.hendrycks_math.hendrycks_math
 from lm_eval.metrics import mean
 from lm_eval.base import Task, rf
@@ -23,6 +28,143 @@ _CITATION = """
 }
 """
 
+# Simple python eval calculator
+# taken from
+# https://github.com/openai/grade-school-math/blob/master/grade_school_math/calculator.py
+@contextmanager
+def timeout(duration, formula):
+    def timeout_handler(signum, frame):
+        raise Exception(f"'{formula}': timed out after {duration} seconds")
+
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.alarm(duration)
+    yield
+    signal.alarm(0)
+
+
+def eval_with_timeout(formula, max_time=3):
+    try:
+        with timeout(max_time, formula):
+            return eval(formula)
+    except Exception as e:
+        signal.alarm(0)
+        print(f"Warning: Failed to eval {formula}, exception: {e}")
+        return None
+
+# MATH dataset answer normalization, taken from https://arxiv.org/pdf/2206.14858.pdf
+SUBSTITUTIONS = [
+    ('an ', ''), ('a ', ''), ('.$', '$'), ('\\$', ''), (r'\ ', ''),
+    (' ', ''), ('mbox', 'text'), (',\\text{and}', ','),
+    ('\\text{and}', ','), ('\\text{m}', '\\text{}')
+]
+REMOVED_EXPRESSIONS = [
+    'square', 'ways', 'integers', 'dollars', 'mph', 'inches', 'ft',
+    'hours', 'km', 'units', '\\ldots', 'sue', 'points', 'feet',
+    'minutes', 'digits', 'cents', 'degrees', 'cm', 'gm', 'pounds',
+    'meters', 'meals', 'edges', 'students', 'childrentickets', 'multiples',
+    '\\text{s}', '\\text{.}', '\\text{\ns}', '\\text{}^2',
+    '\\text{}^3', '\\text{\n}', '\\text{}', r'\mathrm{th}',
+    r'^\circ', r'^{\circ}', r'\;', r',\!', '{,}', '"', '\\dots'
+]
+
+def normalize_final_answer(final_answer: str) -> str:
+    """Normalize a final answer to a quantitative reasoning question."""
+    final_answer = final_answer.split('=')[-1]
+
+    for before, after in SUBSTITUTIONS:
+        final_answer = final_answer.replace(before, after)
+    for expr in REMOVED_EXPRESSIONS:
+        final_answer = final_answer.replace(expr, '')
+
+    # Extract answer that is in LaTeX math, is bold,
+    # is surrounded by a box, etc.
+    final_answer = re.sub(r'(.*?)(\$)(.*?)(\$)(.*)', '$\\3$', final_answer)
+    final_answer = re.sub(r'(\\text\{)(.*?)(\})', '\\2', final_answer)
+    final_answer = re.sub(r'(\\textbf\{)(.*?)(\})', '\\2', final_answer)
+    final_answer = re.sub(r'(\\overline\{)(.*?)(\})', '\\2', final_answer)
+    final_answer = re.sub(r'(\\boxed\{)(.*)(\})', '\\2', final_answer)
+
+    # Normalize shorthand TeX:
+    # \fracab -> \frac{a}{b}
+    # \frac{abc}{bef} -> \frac{abc}{bef}
+    # \fracabc -> \frac{a}{b}c
+    # \sqrta -> \sqrt{a}
+    # \sqrtab -> sqrt{a}b
+    final_answer = re.sub(
+    r'(frac)([^{])(.)', 'frac{\\2}{\\3}', final_answer)
+    final_answer = re.sub(
+    r'(sqrt)([^{])', 'sqrt{\\2}', final_answer)
+    final_answer = final_answer.replace('$', '')
+
+    # Normalize 100,000 -> 100000
+    if final_answer.replace(',', '').isdigit():
+        final_answer = final_answer.replace(',', '')
+
+    return final_answer
+
+# Sympy-based calculator for checking if two entities are the same, taken from https://arxiv.org/pdf/2206.14858.pdf
+def numeric_equality(n1, n2, threshold=0.01):
+    if n1 is None or n2 is None:
+        return False
+    if np.isclose(n1,0) or np.isclose(n2,0) or np.isclose(n1-n2,0):
+        return np.abs(n1-n2) < threshold * (n1+n2)/2
+    else:
+        return np.isclose(n1, n2)
+    
+def symbolic_equality(x,y):
+    if x is None or y is None:
+        return False
+    else:
+        try:
+            return sympy.simplify(x-y) == 0
+        except:
+            return False
+        
+def normalize_symbolic_equation(s: Optional[str]):
+    if not isinstance(s, str):
+        return None
+    if s.startswith('\\['):
+        s = s[2:]
+    if s.endswith('\\]'):
+        s = s[:-2]
+    s = s.replace('\\left(', '(')
+    s = s.replace('\\right)', ')')
+    s = s.replace('\\\\', '\\')
+    if s.startswith('$') or s.endswith('$'):
+        s = s.strip('$')
+    try:
+        maybe_expression = sympy.parsing.latex.parse_latex(s)
+        if not isinstance(maybe_expression, sympy.core.relational.Equality):
+            # we have equation, not expression
+            return None
+        else:
+            return maybe_expression
+    except:
+        return None
+
+def normalize_symbolic_expression(s: Optional[str]):
+    if not isinstance(s, str):
+        return None
+    if s.startswith('\\['):
+        s = s[2:]
+    if s.endswith('\\]'):
+        s = s[:-2]
+    s = s.replace('\\left(', '(')
+    s = s.replace('\\right)', ')')
+    s = s.replace('\\\\', '\\')
+    if s.startswith('$') or s.endswith('$'):
+        s = s.strip('$')
+    try:
+        maybe_expression = sympy.parsing.latex.parse_latex(s)
+        if isinstance(maybe_expression, sympy.core.relational.Equality):
+            # we have equation, not expression
+            return None
+        if isinstance(maybe_expression, sympy.logic.boolalg.BooleanFalse):
+            return None
+        else:
+            return maybe_expression
+    except:
+        return None
 
 class Math(Task):
     DATASET_PATH = inspect.getfile(lm_eval.datasets.hendrycks_math.hendrycks_math)
